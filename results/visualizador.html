@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visualizador</title>
+<style>
+  body { margin: 0; font: 14px monospace; background: #0c0c10; color: #ccc; }
+  #ui { padding: 8px; }
+  .fila { margin-bottom: 4px; }
+  meter { width: 120px; vertical-align: middle; }
+  canvas { display: block; width: 100vw; height: 70vh; } /* el canvas ocupa el resto de la pantalla */
+</style>
+</head>
+<body>
+<!--
+  Cómo funciona, en resumen:
+  1. Cada canal toma una señal (archivo o micrófono) y la pasa por un "analizador" de Web Audio.
+  2. Del analizador se obtiene un nivel entre 0 y 1 (qué tan fuerte suena en ese instante).
+  3. Cada nivel se asigna a un parámetro visual (altura, rotación, color, escala o ruido).
+  4. En cada fotograma se deforma una malla de triángulos y se dibuja con sombreado plano (low poly).
+-->
+<div id="ui">
+  <button id="iniciar">Iniciar</button>
+  <button id="pausaTodo">Pausar todo</button>
+  <button id="reanudaTodo">Reanudar todo</button>
+  <button id="atrasTodo">Retroceder todo 5 s</button>
+  <div id="canales"></div> <!-- aquí se generan las 4 filas de canales desde JavaScript -->
+</div>
+<canvas id="c"></canvas>
+
+<script>
+const PARAMS = ["altura", "rotacion", "color", "escala", "ruido"]; // parámetros visuales disponibles
+const DEFECTO = ["altura", "rotacion", "color", "escala"];          // asignación inicial por canal
+let ctx = null, mics = []; // ctx: AudioContext (se crea al pulsar Iniciar); mics: micrófonos detectados
+
+// ---------- Canales ----------
+// Cada canal guarda su estado: nivel actual, analizador, nodo de origen, etc.
+const canales = [0, 1, 2, 3].map(i => ({
+  i, nivel: 0,      // nivel actual suavizado (0..1)
+  pico: 1e-4,       // volumen máximo reciente, para normalizar
+  analyser: null,   // nodo que mide la señal
+  nodo: null,       // fuente de audio (archivo o micrófono)
+  stream: null,     // flujo del micrófono (para poder cerrarlo)
+  audio: null,      // elemento <audio> (solo archivos)
+  parametro: DEFECTO[i], buf: null
+}));
+
+// Se construye la interfaz de cada canal: fuente, archivo, controles, parámetro y medidor
+const cont = document.getElementById("canales");
+canales.forEach(c => {
+  const fila = document.createElement("div");
+  fila.className = "fila";
+  fila.innerHTML = `${c.i + 1}
+    <select class="fuente"><option value="archivo">Archivo</option><option value="mic:">Micrófono</option></select>
+    <span class="arch">
+      <input class="archivo" type="file" accept="audio/*">
+      <button class="pausa">Pausar</button><button class="reanudar">Reanudar</button><button class="atras">Retroceder 5 s</button>
+      <input class="prog" type="range" min="0" max="1000" value="0" step="1">
+      <span class="tiempo">0:00 / 0:00</span>
+    </span>
+    <select class="param">${PARAMS.map(p => `<option ${p === c.parametro ? "selected" : ""}>${p}</option>`).join("")}</select>
+    <meter min="0" max="1" value="0"></meter>`;
+  cont.appendChild(fila);
+  c.fila = fila;
+  c.meter = fila.querySelector("meter");
+  const fuente = fila.querySelector(".fuente"), archivo = fila.querySelector(".archivo");
+  const arch = fila.querySelector(".arch"), prog = fila.querySelector(".prog");
+  c.prog = prog; c.tiempo = fila.querySelector(".tiempo"); c.arrastrando = false;
+  fila.querySelector(".param").onchange = e => c.parametro = e.target.value;
+  // Al cambiar la fuente: los controles de archivo solo se ven si la fuente es "Archivo"
+  fuente.onchange = () => { arch.style.display = fuente.value === "archivo" ? "" : "none"; conectar(c); };
+  archivo.onchange = () => conectar(c); // nuevo archivo elegido: reconectar el canal
+  // Controles de reproducción (solo tienen efecto si hay un archivo cargado)
+  fila.querySelector(".pausa").onclick = () => c.audio && c.audio.pause();
+  fila.querySelector(".reanudar").onclick = () => c.audio && c.audio.play();
+  fila.querySelector(".atras").onclick = () => { if (c.audio) c.audio.currentTime = Math.max(0, c.audio.currentTime - 5); };
+  // Barra de progreso: mientras se arrastra no se actualiza sola (si no, pelearía con el ratón)
+  prog.onpointerdown = () => c.arrastrando = true;
+  prog.onpointerup = () => c.arrastrando = false;
+  prog.oninput = () => { if (c.audio && isFinite(c.audio.duration)) c.audio.currentTime = prog.value / 1000 * c.audio.duration; };
+});
+
+// Libera lo que el canal tenía conectado antes de asignarle una fuente nueva
+function limpiar(c) {
+  if (c.audio) { c.audio.pause(); c.audio = null; }
+  if (c.stream) { c.stream.getTracks().forEach(t => t.stop()); c.stream = null; }
+  if (c.nodo) { c.nodo.disconnect(); c.nodo = null; }
+}
+
+// Conecta el canal a su fuente (archivo o micrófono) a través de un analizador
+async function conectar(c) {
+  if (!ctx) return; // no se puede hasta pulsar Iniciar (los navegadores exigen un gesto del usuario)
+  limpiar(c);
+  if (!c.analyser) {
+    c.analyser = ctx.createAnalyser();
+    c.analyser.fftSize = 1024;
+    c.buf = new Float32Array(c.analyser.fftSize); // aquí se copian las muestras para medir el volumen
+  }
+  const fuente = c.fila.querySelector(".fuente").value;
+  try {
+    if (fuente === "archivo") {
+      const f = c.fila.querySelector(".archivo").files[0];
+      if (!f) return;
+      c.audio = new Audio(URL.createObjectURL(f));
+      c.audio.loop = true;
+      c.nodo = ctx.createMediaElementSource(c.audio);
+      c.nodo.connect(c.analyser);
+      c.nodo.connect(ctx.destination); // los archivos se escuchan
+      c.audio.play();
+    } else {
+      const id = fuente.slice(4); // el valor es "mic:" + id del dispositivo
+      // Se desactivan los filtros automáticos del navegador para medir la señal real
+      c.stream = await navigator.mediaDevices.getUserMedia({
+        audio: id ? { deviceId: { exact: id }, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+                  : { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+      c.nodo = ctx.createMediaStreamSource(c.stream);
+      c.nodo.connect(c.analyser); // el micrófono no se reproduce (evita acople)
+    }
+  } catch (e) { console.error(e); }
+}
+
+// Botón Iniciar: activa el audio, lista los micrófonos y conecta los 4 canales
+document.getElementById("iniciar").onclick = async e => {
+  ctx = ctx || new AudioContext();
+  await ctx.resume();
+  try { // pedir permiso para poder listar los nombres de los micrófonos
+    (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach(t => t.stop());
+    mics = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput");
+    // Se rellena el selector de fuente de cada canal con los micrófonos encontrados
+    canales.forEach(c => {
+      const sel = c.fila.querySelector(".fuente"), actual = sel.value;
+      sel.innerHTML = `<option value="archivo">Archivo</option>` +
+        mics.map((m, k) => `<option value="mic:${m.deviceId}">${m.label || "Micrófono " + (k + 1)}</option>`).join("");
+      sel.value = actual === "archivo" ? "archivo" : sel.options[1]?.value || "archivo";
+    });
+  } catch (err) { console.warn("Sin acceso a micrófono", err); }
+  canales.forEach(conectar);
+  e.target.disabled = true;
+};
+
+// Botones globales: actúan sobre todos los canales que tengan un archivo
+const archivos = () => canales.filter(c => c.audio);
+document.getElementById("pausaTodo").onclick = () => archivos().forEach(c => c.audio.pause());
+document.getElementById("reanudaTodo").onclick = () => archivos().forEach(c => c.audio.play());
+document.getElementById("atrasTodo").onclick = () =>
+  archivos().forEach(c => c.audio.currentTime = Math.max(0, c.audio.currentTime - 5));
+
+// Convierte segundos a texto "m:ss"
+const mmss = s => isFinite(s) ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}` : "0:00";
+// Actualiza la barra de progreso y el tiempo de un canal (se llama en cada fotograma)
+function actualizarBarra(c) {
+  const a = c.audio;
+  if (!a) { c.prog.value = 0; c.tiempo.textContent = "0:00 / 0:00"; return; }
+  if (!c.arrastrando && isFinite(a.duration)) c.prog.value = a.currentTime / a.duration * 1000;
+  c.tiempo.textContent = `${mmss(a.currentTime)} / ${mmss(a.duration)}`;
+}
+
+// ---------- Malla low poly ----------
+const COLS = 24, FILAS = 15;
+let seed = 7;
+// Generador de números pseudoaleatorios con semilla fija: la malla es igual en cada carga
+const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+const pts0 = [], base = [], tris = []; // puntos (x, y), altura base de cada punto, triángulos (índices)
+for (let j = 0; j < FILAS; j++) for (let i = 0; i < COLS; i++) {
+  const dx = 3.2 / (COLS - 1), dy = 2 / (FILAS - 1);
+  // Cuadrícula regular con los vértices desplazados al azar: la irregularidad da el aspecto low poly
+  const x = -1.6 + i * dx + (rnd() - .5) * .7 * dx;
+  const y = -1 + j * dy + (rnd() - .5) * .7 * dy;
+  pts0.push([x, y]);
+  // Relieve base con ondas seno/coseno; luego se escala con el parámetro "altura"
+  base.push((Math.sin(x * 2.1) * Math.cos(y * 2.6) + .5 * Math.sin(x * 4.3 + y * 3.1)) * .5);
+}
+// Cada celda de la cuadrícula se divide en 2 triángulos (a, b, c, d = sus 4 esquinas).
+// La diagonal alterna según (i+j) para que no quede un patrón demasiado regular.
+for (let j = 0; j < FILAS - 1; j++) for (let i = 0; i < COLS - 1; i++) {
+  const a = j * COLS + i, b = a + 1, c = a + COLS, d = c + 1;
+  if ((i + j) % 2) tris.push([a, b, c], [b, d, c]); else tris.push([a, b, d], [a, d, c]);
+}
+
+// ---------- Render ----------
+const cv = document.getElementById("c"), g = cv.getContext("2d");
+let angulo = 0; // ángulo de giro de la malla
+
+// Calcula el nivel (0..1) de un canal a partir del volumen medido en su analizador
+function nivelDe(c) {
+  if (!c.analyser) return c.nivel = c.nivel * .9; // sin fuente: el nivel decae a cero
+  c.analyser.getFloatTimeDomainData(c.buf);
+  let s = 0;
+  for (const v of c.buf) s += v * v;
+  const rms = Math.sqrt(s / c.buf.length); // rms: medida estándar del volumen
+  // Auto-ganancia: el pico sube al instante con un sonido fuerte y baja muy despacio.
+  // Así el nivel es relativo a cada señal y no hay que ajustar ganancias.
+  c.pico = Math.max(rms, c.pico * .9995, 1e-4);
+  const obj = Math.min(1, rms / c.pico);
+  // Suavizado: sube rápido (ataque) y baja despacio (caída) para que no parpadee
+  c.nivel += (obj - c.nivel) * (obj > c.nivel ? .5 : .08);
+  return c.nivel;
+}
+
+// Convierte color HSV (matiz, saturación, valor; todos 0..1) a texto "rgb(r,g,b)"
+function hsv(h, s, v) {
+  const k = n => (n + h * 6) % 6;
+  const f = n => v - v * s * Math.max(0, Math.min(k(n), 4 - k(n), 1));
+  return `rgb(${f(5) * 255 | 0},${f(3) * 255 | 0},${f(1) * 255 | 0})`;
+}
+
+// Bucle de dibujo: se ejecuta una vez por fotograma
+function frame(ms) {
+  // Ajusta la resolución del canvas al tamaño real de la pantalla
+  const dpr = devicePixelRatio || 1;
+  if (cv.width !== cv.clientWidth * dpr) { cv.width = cv.clientWidth * dpr; cv.height = cv.clientHeight * dpr; }
+  const W = cv.width, H = cv.height, t = ms / 1000; // t: tiempo en segundos, para animar el "ruido"
+
+  // Valor actual de cada parámetro visual (0 si ningún canal lo controla)
+  const v = Object.fromEntries(PARAMS.map(p => [p, 0]));
+  canales.forEach(c => { v[c.parametro] = nivelDe(c); c.meter.value = c.nivel; actualizarBarra(c); });
+
+  // ---- Deformar y rotar la malla según los parámetros ----
+  angulo += .003 + v.rotacion * .05; // gira siempre un poco; el audio la acelera
+  const ca = Math.cos(angulo), sa = Math.sin(angulo), tilt = 1, ct = Math.cos(tilt), st = Math.sin(tilt);
+  const esc = 1 + v.escala * .8;              // escala: agranda toda la malla
+  const alt = .2 + 2.2 * v.altura;            // altura: relieve más o menos marcado
+  const f = Math.min(W, H) * .55 * 3.2;       // factor de zoom de la proyección
+
+  const P = pts0.map(([x0, y0], k) => {
+    // ruido: los vértices vibran en x e y con una onda que depende del tiempo
+    let x = x0 + Math.sin(t * 6 + y0 * 5) * v.ruido * .08;
+    let y = y0 + Math.cos(t * 5 + x0 * 5) * v.ruido * .08;
+    let z = base[k] * alt;
+    x *= esc; y *= esc; z *= esc;
+    // 1) giro alrededor del eje vertical
+    const rx = x * ca - y * sa, ry = x * sa + y * ca;
+    // 2) inclinación fija hacia la cámara para ver la malla desde arriba
+    const y2 = ry * ct - z * st, z2 = ry * st + z * ct;
+    // 3) proyección a 2D con perspectiva simple (lo lejano se ve más pequeño)
+    const prof = 1 / (4 - y2 * .8);
+    return { x: rx, y: y2, z: z2, sx: W / 2 + rx * f * prof, sy: H / 2 - z2 * f * prof };
+  });
+
+  // ---- Sombreado plano: cada triángulo tiene un único brillo ----
+  const luz = [.3, -.5, .8], ln = Math.hypot(...luz); // dirección de la luz y su longitud
+  const caras = tris.map(([a, b, c]) => {
+    const A = P[a], B = P[b], C = P[c];
+    // Normal de la cara = producto cruz de dos de sus aristas
+    const u = [B.x - A.x, B.y - A.y, B.z - A.z], w = [C.x - A.x, C.y - A.y, C.z - A.z];
+    const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+    const nn = Math.hypot(...n) + 1e-9;
+    // Más alineada con la luz = más brillo
+    const br = .25 + .75 * Math.abs((n[0] * luz[0] + n[1] * luz[1] + n[2] * luz[2]) / (nn * ln));
+    return { A, B, C, br, prof: A.y + B.y + C.y };
+  }).sort((p, q) => q.prof - p.prof); // algoritmo del pintor: primero los triángulos más lejanos
+
+  // ---- Dibujo ----
+  g.fillStyle = "#0c0c10";
+  g.fillRect(0, 0, W, H);
+  const matiz = (.55 + v.color * .45) % 1; // color: el audio desplaza el matiz (azul -> rojo)
+  for (const { A, B, C, br } of caras) {
+    g.fillStyle = g.strokeStyle = hsv((matiz + br * .08) % 1, .65, Math.min(1, br));
+    g.beginPath(); g.moveTo(A.sx, A.sy); g.lineTo(B.sx, B.sy); g.lineTo(C.sx, C.sy); g.closePath();
+    g.fill(); g.stroke(); // el trazo evita costuras entre polígonos
+  }
+  requestAnimationFrame(frame); // programa el siguiente fotograma
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
