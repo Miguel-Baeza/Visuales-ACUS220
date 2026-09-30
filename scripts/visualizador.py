@@ -53,7 +53,8 @@ class Canal:
         self.fuente = fuente        # texto recibido por línea de comandos
         self.parametro = parametro  # parámetro visual que controla esta señal
         self.nivel = 0.0            # volumen actual suavizado, entre 0 y 1
-        self.pico = 1e-4            # volumen máximo reciente (sirve para normalizar)
+        self.techo = 1e-4           # volumen máximo reciente (sube al instante, baja despacio)
+        self.suelo = 0.0            # volumen mínimo reciente (sube despacio, baja al instante)
         self.datos = None           # muestras del archivo (None si es micrófono)
         self.pos = 0                # posición de lectura dentro del archivo, en muestras
         self.pausado = False
@@ -66,12 +67,16 @@ class Canal:
 
     def _actualizar(self, rms):
         """Convierte el volumen medido (rms) en un nivel estable entre 0 y 1."""
-        # Auto-ganancia: el pico sube al instante con un sonido fuerte y baja muy despacio.
-        # Así el nivel es relativo al volumen de cada señal y no hay que ajustar ganancias.
-        self.pico = max(rms, self.pico * 0.9995, 1e-4)
-        objetivo = min(1.0, rms / self.pico)
+        # Rango dinámico adaptativo: el nivel se mide entre el volumen más bajo y el más alto
+        # recientes de ESTA señal. Así el nivel recorre de verdad de 0 a 1 aunque la señal
+        # sea constante o esté comprimida (antes se quedaba casi fijo cerca de 1).
+        self.techo = max(rms, self.techo * 0.998, 1e-4)
+        # El suelo nunca sube más del 60% del techo: una señal estable da nivel alto, no cero
+        self.suelo = min(rms, self.suelo + (0.6 * self.techo - self.suelo) * 0.003)
+        self.suelo = min(self.suelo, 0.6 * self.techo)
+        objetivo = min(1.0, max(0.0, (rms - self.suelo) / (self.techo - self.suelo + 1e-9)))
         # Suavizado: sube rápido (ataque) y baja despacio (caída) para que no parpadee
-        k = 0.5 if objetivo > self.nivel else 0.08
+        k = 0.5 if objetivo > self.nivel else 0.12
         self.nivel += (objetivo - self.nivel) * k
 
     # ---- archivo ----
@@ -271,17 +276,18 @@ def main():
         t = pygame.time.get_ticks() / 1000  # tiempo en segundos, para animar el "ruido"
 
         # ---- Deformar la malla según los parámetros ----
-        angulo += 0.003 + v["rotacion"] * 0.05  # gira siempre un poco; el audio la acelera
+        angulo += 0.004 + v["rotacion"] * 0.08  # gira siempre un poco; el audio la acelera
+        giro = angulo + v["rotacion"] * 0.8     # además, empuja el giro al instante (se nota el pulso)
         pts = pts0.copy()
         pts[:, 2] = base_z * (0.2 + 2.2 * v["altura"])  # altura: relieve más o menos marcado
         # ruido: los vértices vibran en x e y con una onda que depende del tiempo
         pts[:, 0] += np.sin(t * 6 + pts0[:, 1] * 5) * v["ruido"] * 0.08
         pts[:, 1] += np.cos(t * 5 + pts0[:, 0] * 5) * v["ruido"] * 0.08
-        pts *= 1.0 + v["escala"] * 0.8  # escala: agranda toda la malla
+        pts *= 0.65 + v["escala"] * 0.6  # escala: de 0.65x (silencio) a 1.25x (nivel máximo)
 
         # ---- Rotación 3D ----
         # 1) giro alrededor del eje vertical (el ángulo que crece con el tiempo)
-        ca, sa = math.cos(angulo), math.sin(angulo)
+        ca, sa = math.cos(giro), math.sin(giro)
         x = pts[:, 0] * ca - pts[:, 1] * sa
         y = pts[:, 0] * sa + pts[:, 1] * ca
         z = pts[:, 2]
@@ -295,8 +301,8 @@ def main():
         w, h = pantalla.get_size()
         f = min(w, h) * 0.55
         prof = 1.0 / (4.0 - rot[:, 1] * 0.8)
-        sx = w / 2 + rot[:, 0] * f * prof * 3.2
-        sy = h / 2 - rot[:, 2] * f * prof * 3.2
+        sx = w / 2 + rot[:, 0] * f * prof * 2.4
+        sy = h / 2 - rot[:, 2] * f * prof * 2.4
 
         # ---- Sombreado plano: cada triángulo tiene un único brillo ----
         A, B, C = rot[tris[:, 0]], rot[tris[:, 1]], rot[tris[:, 2]]  # vértices de cada triángulo
@@ -310,7 +316,7 @@ def main():
 
         # ---- Dibujo ----
         pantalla.fill((12, 12, 16))
-        matiz = (0.55 + v["color"] * 0.45) % 1.0  # color: el audio desplaza el matiz (azul -> rojo)
+        matiz = (0.6 + v["color"] * 0.9) % 1.0  # color: el audio recorre casi toda la rueda de colores
         for k in orden:
             r, g, b = colorsys.hsv_to_rgb((matiz + br[k] * 0.08) % 1.0, 0.65, min(1.0, br[k]))
             poli = [(sx[i], sy[i]) for i in tris[k]]

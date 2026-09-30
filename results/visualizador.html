@@ -38,7 +38,8 @@ let ctx = null, mics = []; // ctx: AudioContext (se crea al pulsar Iniciar); mic
 // Cada canal guarda su estado: nivel actual, analizador, nodo de origen, etc.
 const canales = [0, 1, 2, 3].map(i => ({
   i, nivel: 0,      // nivel actual suavizado (0..1)
-  pico: 1e-4,       // volumen máximo reciente, para normalizar
+  techo: 1e-4,      // volumen máximo reciente (sube al instante, baja despacio)
+  suelo: 0,         // volumen mínimo reciente (sube despacio, baja al instante)
   analyser: null,   // nodo que mide la señal
   nodo: null,       // fuente de audio (archivo o micrófono)
   stream: null,     // flujo del micrófono (para poder cerrarlo)
@@ -190,12 +191,16 @@ function nivelDe(c) {
   let s = 0;
   for (const v of c.buf) s += v * v;
   const rms = Math.sqrt(s / c.buf.length); // rms: medida estándar del volumen
-  // Auto-ganancia: el pico sube al instante con un sonido fuerte y baja muy despacio.
-  // Así el nivel es relativo a cada señal y no hay que ajustar ganancias.
-  c.pico = Math.max(rms, c.pico * .9995, 1e-4);
-  const obj = Math.min(1, rms / c.pico);
+  // Rango dinámico adaptativo: el nivel se mide entre el volumen más bajo y el más alto
+  // recientes de ESTA señal. Así recorre de verdad de 0 a 1 aunque la señal sea constante
+  // o esté comprimida (antes se quedaba casi fijo cerca de 1).
+  c.techo = Math.max(rms, c.techo * .998, 1e-4);
+  // El suelo nunca sube más del 60% del techo: una señal estable da nivel alto, no cero
+  c.suelo = Math.min(rms, c.suelo + (.6 * c.techo - c.suelo) * .003);
+  c.suelo = Math.min(c.suelo, .6 * c.techo);
+  const obj = Math.min(1, Math.max(0, (rms - c.suelo) / (c.techo - c.suelo + 1e-9)));
   // Suavizado: sube rápido (ataque) y baja despacio (caída) para que no parpadee
-  c.nivel += (obj - c.nivel) * (obj > c.nivel ? .5 : .08);
+  c.nivel += (obj - c.nivel) * (obj > c.nivel ? .5 : .12);
   return c.nivel;
 }
 
@@ -218,11 +223,12 @@ function frame(ms) {
   canales.forEach(c => { v[c.parametro] = nivelDe(c); c.meter.value = c.nivel; actualizarBarra(c); });
 
   // ---- Deformar y rotar la malla según los parámetros ----
-  angulo += .003 + v.rotacion * .05; // gira siempre un poco; el audio la acelera
-  const ca = Math.cos(angulo), sa = Math.sin(angulo), tilt = 1, ct = Math.cos(tilt), st = Math.sin(tilt);
-  const esc = 1 + v.escala * .8;              // escala: agranda toda la malla
+  angulo += .004 + v.rotacion * .08; // gira siempre un poco; el audio la acelera
+  const giro = angulo + v.rotacion * .8; // además, empuja el giro al instante (se nota el pulso)
+  const ca = Math.cos(giro), sa = Math.sin(giro), tilt = 1, ct = Math.cos(tilt), st = Math.sin(tilt);
+  const esc = .65 + v.escala * .6;            // escala: de 0.65x (silencio) a 1.25x (nivel máximo)
   const alt = .2 + 2.2 * v.altura;            // altura: relieve más o menos marcado
-  const f = Math.min(W, H) * .55 * 3.2;       // factor de zoom de la proyección
+  const f = Math.min(W, H) * .55 * 2.4;       // factor de zoom de la proyección
 
   const P = pts0.map(([x0, y0], k) => {
     // ruido: los vértices vibran en x e y con una onda que depende del tiempo
@@ -255,7 +261,7 @@ function frame(ms) {
   // ---- Dibujo ----
   g.fillStyle = "#0c0c10";
   g.fillRect(0, 0, W, H);
-  const matiz = (.55 + v.color * .45) % 1; // color: el audio desplaza el matiz (azul -> rojo)
+  const matiz = (.6 + v.color * .9) % 1;   // color: el audio recorre casi toda la rueda de colores
   for (const { A, B, C, br } of caras) {
     g.fillStyle = g.strokeStyle = hsv((matiz + br * .08) % 1, .65, Math.min(1, br));
     g.beginPath(); g.moveTo(A.sx, A.sy); g.lineTo(B.sx, B.sy); g.lineTo(C.sx, C.sy); g.closePath();
