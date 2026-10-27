@@ -7,6 +7,15 @@ Uso (una entrada -c por canal, cada una es un archivo o un micrófono):
   python visualizador.py -c bajo.wav -c bateria.wav -c mic -c mic:2 \
                          -p altura -p rotacion -p color -p escala
 
+Ejemplos con 4 micrófonos:
+  python visualizador.py --listar                       (muestra dispositivos y sus entradas)
+  # Interfaz multicanal (una entrada física por señal):
+  python visualizador.py -c mic:2:0 -c mic:2:1 -c mic:2:2 -c mic:2:3
+  # Cuatro dispositivos distintos (USB, integrado...), por número o por parte del nombre:
+  python visualizador.py -c mic:1 -c mic:3 -c mic:Scarlett -c mic:USB
+  # Mezcla de archivos y micrófonos:
+  python visualizador.py -c bajo.wav -c mic:2:1 -c mic:2:2 -c batería.wav
+
 Fuentes:
   ruta/al/archivo.wav        archivo (se reproduce en bucle)
   mic                        micrófono por defecto
@@ -58,10 +67,10 @@ class Canal:
         self.datos = None           # muestras del archivo (None si es micrófono)
         self.pos = 0                # posición de lectura dentro del archivo, en muestras
         self.pausado = False
-        self.stream = None          # entrada de audio abierta (solo micrófonos)
+        self.mic = None             # (dispositivo, entrada) si es micrófono; se abre después, compartido
         # Según el texto, la fuente es un micrófono o un archivo
         if fuente.startswith("mic"):
-            self._abrir_mic(fuente)
+            self.mic = parsear_mic(fuente)
         else:
             self._cargar_archivo(fuente)
 
@@ -124,23 +133,52 @@ class Canal:
         """Fracción del archivo que ya sonó (para dibujar la barra)."""
         return self.pos / len(self.datos) if self.datos is not None else 0.0
 
-    # ---- micrófono ----
-    def _abrir_mic(self, fuente):
-        """Abre una entrada de audio. Formato: mic[:dispositivo[:canal]]"""
-        partes = fuente.split(":")
-        disp = partes[1] if len(partes) > 1 and partes[1] != "" else None
-        if disp is not None and disp.isdigit():
-            disp = int(disp)  # número de dispositivo; si no, se busca por nombre
-        canal = int(partes[2]) if len(partes) > 2 else 0
 
-        # sounddevice llama a esta función cada vez que llega un bloque de audio
-        def cb(indata, frames, t, status):
-            self._actualizar(float(np.sqrt(np.mean(indata[:, canal] ** 2))))
+def parsear_mic(fuente):
+    """Interpreta 'mic[:dispositivo[:entrada]]' y devuelve (dispositivo, entrada)."""
+    partes = fuente.split(":")
+    disp = partes[1] if len(partes) > 1 and partes[1] != "" else None  # None = dispositivo por defecto
+    if disp is not None and disp.isdigit():
+        disp = int(disp)  # número de dispositivo; si no, se busca por nombre
+    entrada = int(partes[2]) if len(partes) > 2 else 0  # 0 = primera entrada del dispositivo
+    return disp, entrada
 
-        # Se abren canal+1 canales para poder leer el que se pidió
-        self.stream = sd.InputStream(device=disp, channels=canal + 1, samplerate=SR,
-                                     blocksize=1024, callback=cb)
+
+class EntradaMic:
+    """Un dispositivo de entrada abierto UNA sola vez y compartido por varios canales.
+
+    Abrir el mismo dispositivo varias veces suele fallar, así que se abre un único stream
+    con todas las entradas necesarias y cada canal lee la suya.
+    """
+
+    def __init__(self, disp, oyentes):
+        self.oyentes = oyentes  # lista de (numero_de_entrada, Canal)
+        n = max(k for k, _ in oyentes) + 1  # entradas que hay que abrir
+        try:
+            disponibles = sd.query_devices(disp, "input")["max_input_channels"]
+        except Exception as e:
+            sys.exit(f"No se encontró el dispositivo de entrada {disp!r}: {e}\nUsa --listar para verlos.")
+        if n > disponibles:
+            sys.exit(f"El dispositivo {disp!r} solo tiene {disponibles} entrada(s) y pediste la {n} "
+                     f"(se numeran desde 0). Usa --listar para ver sus entradas.")
+        self.stream = sd.InputStream(device=disp, channels=n, samplerate=SR, blocksize=1024,
+                                     callback=self._cb)
         self.stream.start()
+
+    def _cb(self, indata, frames, t, status):
+        # sounddevice llama aquí con cada bloque de audio; indata[:, k] es la entrada k
+        for k, canal in self.oyentes:
+            canal._actualizar(float(np.sqrt(np.mean(indata[:, k] ** 2))))
+
+
+def abrir_entradas(canales):
+    """Agrupa los canales de micrófono por dispositivo y abre cada dispositivo una vez."""
+    grupos = {}
+    for c in canales:
+        if c.mic is not None:
+            disp, entrada = c.mic
+            grupos.setdefault(disp, []).append((entrada, c))
+    return [EntradaMic(disp, oyentes) for disp, oyentes in grupos.items()]
 
 
 def crear_malla(cols=24, filas=15, semilla=7):
@@ -208,10 +246,14 @@ def dibujar_ui(pantalla, fuente_ui, canales):
 def main():
     # ---- Argumentos de línea de comandos ----
     ap = argparse.ArgumentParser()
-    ap.add_argument("-c", "--canal", action="append", required=True, help="archivo o mic (x4)")
+    ap.add_argument("-c", "--canal", action="append", help="archivo o mic (x4)")
+    ap.add_argument("--listar", action="store_true", help="lista los dispositivos de audio y sale")
     ap.add_argument("-p", "--param", action="append", choices=PARAMS, help="parámetro por canal")
     a = ap.parse_args()
-    if len(a.canal) != 4:
+    if a.listar:  # ayuda para saber qué número de dispositivo y entrada usar en mic:DISP:ENTRADA
+        print(sd.query_devices())
+        return
+    if len(a.canal or []) != 4:
         sys.exit("Necesitas exactamente 4 canales (-c).")
     params = a.param or PARAMS[:4]  # por defecto: altura, rotacion, color, escala
     if len(params) != 4:
@@ -219,6 +261,7 @@ def main():
 
     # ---- Audio ----
     canales = [Canal(f, p) for f, p in zip(a.canal, params)]
+    entradas = abrir_entradas(canales)  # micrófonos: un stream por dispositivo (hasta 4 señales)
     archivos = [c for c in canales if c.datos is not None]
     if archivos:
         # Un único stream de salida reproduce la mezcla de todos los archivos.
