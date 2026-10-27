@@ -8,24 +8,7 @@ Un visualizador 3D reactivo al audio desarrollado en Python. Genera en tiempo re
 
 - **Control multicanal modular:** Recibe exactamente 4 entradas de audio independientes de manera simultánea.
 - **Fuentes híbridas:** Admite combinar archivos de audio local (`.wav`), el micrófono por defecto del sistema, o canales específicos de interfaces de audio multicanal.
-- **Rango dinámico adaptativo:** Normalización automática del nivel RMS (*ataque rápido / caída suave*) para garantizar que la reactividad visual se adapte dinámicamente al volumen de cada entrada.
-- **Malla 3D personalizada:** Generación de malla irregular mediante trigonometría, proyección en perspectiva 2D y renderizado con sombreado plano (*flat shading*).
+- **Rango dinámico adaptativo:** Normalización automática del nivel RMS (ataque rápido / caída suave) para garantizar que la reactividad visual se adapte dinámicamente al volumen de cada entrada.
+- **Malla 3D personalizada:** Generación de malla irregular mediante trigonometría, proyección en perspectiva 2D y renderizado con sombreado plano.
 - **Interfaz GUI integrada:** Controles de transporte interactivos para archivos (pausa, reanudación, salto de tiempo), medidores de nivel dinámicos y soporte para pantalla completa.
 
----
-
-## Requisitos e Instalación
-
-### Dependencias de Python
-
-El proyecto requiere **Python 3.8+** y las siguientes bibliotecas:
-
-- `numpy`
-- `pygame`
-- `sounddevice`
-- `soundfile`
-
-Puedes instalarlas todas ejecutando en tu terminal:
-
-```bash
-pip install numpy pygame sounddevice soundfile
