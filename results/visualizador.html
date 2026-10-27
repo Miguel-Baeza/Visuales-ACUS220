@@ -22,6 +22,7 @@
 -->
 <div id="ui">
   <button id="iniciar">Iniciar</button>
+  <button id="usarMics">Asignar micrófonos a los 4 canales</button>
   <button id="pausaTodo">Pausar todo</button>
   <button id="reanudaTodo">Reanudar todo</button>
   <button id="atrasTodo">Retroceder todo 5 s</button>
@@ -54,6 +55,7 @@ canales.forEach(c => {
   fila.className = "fila";
   fila.innerHTML = `${c.i + 1}
     <select class="fuente"><option value="archivo">Archivo</option><option value="mic:">Micrófono</option></select>
+    <select class="canalmic" style="display:none">${[1,2,3,4,5,6,7,8].map(n => `<option value="${n - 1}">entrada ${n}</option>`).join("")}</select>
     <span class="arch">
       <input class="archivo" type="file" accept="audio/*">
       <button class="pausa">Pausar</button><button class="reanudar">Reanudar</button><button class="atras">Retroceder 5 s</button>
@@ -70,7 +72,8 @@ canales.forEach(c => {
   c.prog = prog; c.tiempo = fila.querySelector(".tiempo"); c.arrastrando = false;
   fila.querySelector(".param").onchange = e => c.parametro = e.target.value;
   // Al cambiar la fuente: los controles de archivo solo se ven si la fuente es "Archivo"
-  fuente.onchange = () => { arch.style.display = fuente.value === "archivo" ? "" : "none"; conectar(c); };
+  fuente.onchange = () => { sincronizar(c); conectar(c); };
+  fila.querySelector(".canalmic").onchange = () => conectar(c); // otra entrada del mismo dispositivo
   archivo.onchange = () => conectar(c); // nuevo archivo elegido: reconectar el canal
   // Controles de reproducción (solo tienen efecto si hay un archivo cargado)
   fila.querySelector(".pausa").onclick = () => c.audio && c.audio.pause();
@@ -82,10 +85,34 @@ canales.forEach(c => {
   prog.oninput = () => { if (c.audio && isFinite(c.audio.duration)) c.audio.currentTime = prog.value / 1000 * c.audio.duration; };
 });
 
+// Muestra los controles que corresponden a la fuente elegida (archivo o micrófono)
+function sincronizar(c) {
+  const esArchivo = c.fila.querySelector(".fuente").value === "archivo";
+  c.fila.querySelector(".arch").style.display = esArchivo ? "" : "none";
+  c.fila.querySelector(".canalmic").style.display = esArchivo ? "none" : "";
+}
+
+// Micrófonos abiertos, por dispositivo. Varios canales pueden compartir un mismo dispositivo
+// (por ejemplo una interfaz con 4 entradas), así que se abre una sola vez y se reparte.
+const entradas = {};
+function abrirMic(id) {
+  if (!entradas[id]) entradas[id] = (async () => {
+    // Se desactivan los filtros del navegador (si no, suele entregar solo 1 canal y alterar la señal)
+    const base = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 8 } };
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: id ? { ...base, deviceId: { exact: id } } : base });
+    const n = stream.getAudioTracks()[0].getSettings().channelCount || 1; // entradas que entregó el dispositivo
+    return { id, stream, fuente: ctx.createMediaStreamSource(stream), canales: n, usos: 0 };
+  })().catch(e => { delete entradas[id]; throw e; });
+  return entradas[id];
+}
+
 // Libera lo que el canal tenía conectado antes de asignarle una fuente nueva
 function limpiar(c) {
   if (c.audio) { c.audio.pause(); c.audio = null; }
-  if (c.stream) { c.stream.getTracks().forEach(t => t.stop()); c.stream = null; }
+  if (c.reg) { // micrófono: se cierra el dispositivo solo cuando ningún canal lo usa
+    if (--c.reg.usos <= 0) { c.reg.stream.getTracks().forEach(t => t.stop()); delete entradas[c.reg.id]; }
+    c.reg = null;
+  }
   if (c.nodo) { c.nodo.disconnect(); c.nodo = null; }
 }
 
@@ -111,13 +138,14 @@ async function conectar(c) {
       c.audio.play();
     } else {
       const id = fuente.slice(4); // el valor es "mic:" + id del dispositivo
-      // Se desactivan los filtros automáticos del navegador para medir la señal real
-      c.stream = await navigator.mediaDevices.getUserMedia({
-        audio: id ? { deviceId: { exact: id }, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-                  : { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-      });
-      c.nodo = ctx.createMediaStreamSource(c.stream);
-      c.nodo.connect(c.analyser); // el micrófono no se reproduce (evita acople)
+      const reg = await abrirMic(id);
+      reg.usos++; c.reg = reg;
+      // Un separador de canales aísla la entrada elegida de este canal
+      const k = Math.min(+c.fila.querySelector(".canalmic").value, reg.canales - 1);
+      const split = ctx.createChannelSplitter(reg.canales);
+      reg.fuente.connect(split);
+      split.connect(c.analyser, k); // solo la entrada k llega al analizador
+      c.nodo = split;               // el micrófono no se reproduce (evita acople)
     }
   } catch (e) { console.error(e); }
 }
@@ -135,10 +163,24 @@ document.getElementById("iniciar").onclick = async e => {
       sel.innerHTML = `<option value="archivo">Archivo</option>` +
         mics.map((m, k) => `<option value="mic:${m.deviceId}">${m.label || "Micrófono " + (k + 1)}</option>`).join("");
       sel.value = actual === "archivo" ? "archivo" : sel.options[1]?.value || "archivo";
+      sincronizar(c);
     });
   } catch (err) { console.warn("Sin acceso a micrófono", err); }
   canales.forEach(conectar);
   e.target.disabled = true;
+};
+
+// Asigna una entrada de micrófono a cada canal: un dispositivo por canal si hay 4 o más;
+// si hay menos, usa un mismo dispositivo multicanal y una entrada distinta por canal.
+document.getElementById("usarMics").onclick = () => {
+  if (!ctx || !mics.length) return; // primero hay que pulsar Iniciar y dar permiso
+  canales.forEach((c, k) => {
+    const dispositivo = mics[k] || mics[0];
+    c.fila.querySelector(".fuente").value = "mic:" + dispositivo.deviceId;
+    c.fila.querySelector(".canalmic").value = mics[k] ? 0 : k;
+    sincronizar(c);
+    conectar(c);
+  });
 };
 
 // Botones globales: actúan sobre todos los canales que tengan un archivo
